@@ -74,6 +74,7 @@ const projectSchema = z.object({
   prefix: z.string(),
   color: z.string().default(""),
   folderId: z.string().nullable().optional(),
+  linkedBbProjectId: z.string().startsWith("proj_").nullable().optional(),
 });
 
 const labelSchema = z.object({
@@ -500,6 +501,72 @@ export async function countActiveTasks(bb: TasksBridgeApi): Promise<number> {
   return tasks.length;
 }
 
+const TASK_KEY_IN_TITLE = /^([A-Za-z][A-Za-z0-9]*-\d+)\b/;
+
+type ThreadLookupApi = TasksBridgeApi & {
+  sdk: TasksBridgeApi["sdk"] & {
+    threads: {
+      get(args: { threadId: string }): Promise<{
+        id: string;
+        title?: string | null;
+      }>;
+    };
+  };
+};
+
+/**
+ * Resolve which task (if any) has this bb thread attached.
+ * Fast path: parse KEY from the thread title (dispatch titles are "TP-12 · …")
+ * and verify the attachment. Fallback: scan task_threads via listTaskThreads.
+ */
+export async function findTaskForThread(
+  bb: ThreadLookupApi,
+  threadId: string,
+): Promise<{ taskKey: string; taskId: string } | null> {
+  const normalizedThreadId = threadId.trim();
+  if (!normalizedThreadId.startsWith("thr_")) return null;
+
+  try {
+    const thread = await bb.sdk.threads.get({ threadId: normalizedThreadId });
+    const title = (thread.title ?? "").trim();
+    const keyMatch = TASK_KEY_IN_TITLE.exec(title);
+    if (keyMatch?.[1]) {
+      const view = await loadTaskView(bb, keyMatch[1]);
+      if (view?.threads.some((row) => row.threadId === normalizedThreadId)) {
+        return { taskKey: view.task.key, taskId: view.task.id };
+      }
+    }
+  } catch {
+    // Fall through to a full scan when the thread or title path fails.
+  }
+
+  const tasks = await listAllTasks(bb, {});
+  const matches = await mapWithConcurrency(
+    tasks,
+    THREAD_FANOUT_CONCURRENCY,
+    async (task) => {
+      const threads = await listThreadsForTask(bb, task.id);
+      const hit = threads.find((row) => row.threadId === normalizedThreadId);
+      if (!hit) return null;
+      return {
+        taskKey: task.key,
+        taskId: task.id,
+        attachedAt: hit.attachedAt,
+      };
+    },
+  );
+
+  const found = matches
+    .filter(
+      (row): row is { taskKey: string; taskId: string; attachedAt: string } =>
+        row != null,
+    )
+    .sort((a, b) => b.attachedAt.localeCompare(a.attachedAt));
+
+  const best = found[0];
+  return best ? { taskKey: best.taskKey, taskId: best.taskId } : null;
+}
+
 /** Resolve a key (PRO-1) or task id to a full view. */
 export async function loadTaskView(
   bb: TasksBridgeApi,
@@ -561,6 +628,21 @@ export async function loadTaskView(
     pullRequests: pullRequestView.pullRequests,
     unavailableThreadIds: pullRequestView.unavailableThreadIds,
   };
+}
+
+/** Direct children of a task, oldest first — used for dispatch seed prompts. */
+export async function listSubtasks(
+  bb: TasksBridgeApi,
+  parentTaskId: string,
+): Promise<TaskRecord[]> {
+  try {
+    const tasks = await listAllTasks(bb, { parentTaskId });
+    return tasks
+      .filter((task) => task.parentTaskId === parentTaskId)
+      .sort((a, b) => a.number - b.number);
+  } catch {
+    return [];
+  }
 }
 
 export async function searchTasks(
@@ -774,12 +856,25 @@ export async function updatePreset(
 const DISPATCH_COMMENT_LIMIT = 20;
 const DISPATCH_COMMENT_CHAR_BUDGET = 14_000;
 
+/**
+ * Tasks Pro posts its own one-line bookkeeping comments ("Spun …",
+ * "Assigned to …"). They help a human read the task, but they are noise in a
+ * seed prompt and they crowd out real notes after a few redispatches.
+ */
+const BOOKKEEPING_COMMENT =
+  /^(Spun .+ on .+ · thr_|Assigned to me$|Assigned to existing thread · )/;
+
 /** User + agent comments only, newest last, capped by count and chars. */
 export function formatDispatchCommentPack(
   comments: CommentRecord[],
 ): string {
   const useful = comments
-    .filter((comment) => comment.kind !== "system" && comment.body.trim())
+    .filter(
+      (comment) =>
+        comment.kind !== "system" &&
+        comment.body.trim() &&
+        !BOOKKEEPING_COMMENT.test(comment.body.trim()),
+    )
     .slice()
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 

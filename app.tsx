@@ -48,6 +48,18 @@ import {
   type ListPreference,
   type TaskSort,
 } from "@/lib/list-preference";
+import {
+  describeEnvTargetDraft,
+  EMPTY_ENV_TARGET,
+  ENV_TARGET_KINDS,
+  ENV_TARGET_LABELS,
+  environmentOptionLabel,
+  envTargetError,
+  envTargetInput,
+  isEnvTargetKind,
+  type EnvTargetDraft,
+} from "@/lib/env-target-ui";
+import type { EnvProfile, EnvironmentOption } from "@/lib/env-target";
 import { cn } from "@/lib/utils";
 import {
   DEFAULT_PRESET_NAME,
@@ -132,6 +144,7 @@ interface ProjectRow {
   prefix: string;
   color: string;
   folderId?: string | null;
+  linkedBbProjectId?: string | null;
 }
 
 interface FolderRow {
@@ -179,9 +192,31 @@ interface LabelRow {
   color: string;
 }
 
+/** Tasks has no human assignee, so Tasks Pro keeps its own (see lib/assignee.ts). */
+type AssigneeRow =
+  | { kind: "me"; assignedAt: string }
+  | { kind: "thread"; threadId: string; title: string; assignedAt: string }
+  | {
+      kind: "agent";
+      threadId: string;
+      title: string;
+      presetName: string;
+      assignedAt: string;
+    };
+
+interface AssignableThreadRow {
+  id: string;
+  title: string;
+  projectId: string;
+  status: string;
+  updatedAt: number;
+}
+
 interface TaskPanelProps {
   initialKey?: string;
   syncSubPath?: boolean;
+  /** Set when the panel is mounted inside a thread; enables "Assign to this thread". */
+  currentThreadId?: string;
 }
 
 function formatWhen(iso: string): string {
@@ -541,6 +576,13 @@ function PresetDialog({
   >(null);
   const [reasoningLevels, setReasoningLevels] = useState<string[]>([]);
   const [machines, setMachines] = useState<{ id: string; name: string }[]>([]);
+  const [envProfiles, setEnvProfiles] = useState<EnvProfile[]>([]);
+  // Default environment profile for this preset. Tasks owns the preset record,
+  // so this lives in local storage next to the remembered preset id.
+  const [defaultProfileId, setDefaultProfileId] = useState(() => {
+    const stored = readStoredEnvTarget(editing?.id ?? "");
+    return stored.kind === "profile" ? stored.profileId : "";
+  });
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const modelsResolvedOnceRef = useRef(false);
@@ -633,6 +675,23 @@ function PresetDialog({
     setField("modelId", fallback ? fallback.id : "");
   }, [draft.modelId, editing, modelCustom, models]);
 
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    void rpc
+      .call("listEnvProfiles", null)
+      .then((result) => {
+        if (cancelled) return;
+        setEnvProfiles(result.available ? result.profiles : []);
+      })
+      .catch(() => {
+        if (!cancelled) setEnvProfiles([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, rpc]);
+
   const providerPermissionModes =
     !providerCustom && draft.providerId !== ""
       ? (providers
@@ -702,6 +761,12 @@ function PresetDialog({
       if (!result.ok || !result.preset) {
         throw new Error(result.error ?? "Failed to save preset.");
       }
+      writeStoredEnvTarget(
+        result.preset.id,
+        defaultProfileId
+          ? { ...EMPTY_ENV_TARGET, kind: "profile", profileId: defaultProfileId }
+          : EMPTY_ENV_TARGET,
+      );
       onSaved(result.preset);
       onOpenChange(false);
     } catch (err) {
@@ -903,6 +968,27 @@ function PresetDialog({
               ))}
             </select>
           </PresetField>
+          <PresetField label="Default environment">
+            <select
+              aria-label="Default environment"
+              className={PRESET_SELECT_CLASS}
+              value={defaultProfileId}
+              onChange={(event) => setDefaultProfileId(event.target.value)}
+            >
+              <option value="">
+                Preset default (use execution environment)
+              </option>
+              {envProfiles.map((profile) => (
+                <option key={profile.id} value={profile.id}>
+                  {profile.name}
+                </option>
+              ))}
+            </select>
+            <p className="text-[11px] text-muted-foreground">
+              Preselects an environment profile when you spin this preset. The
+              execution environment above still applies when no profile is set.
+            </p>
+          </PresetField>
           {draft.environmentKind === "new-worktree" ? (
             <div className="grid grid-cols-2 gap-3">
               <PresetField label="Base branch">
@@ -1058,7 +1144,7 @@ function ProjectDialog({
   const [name, setName] = useState("");
   const [prefix, setPrefix] = useState("");
   const [prefixTouched, setPrefixTouched] = useState(false);
-  const [color, setColor] = useState(DEFAULT_PROJECT_COLOR);
+  const [color, setColor] = useState<string>(DEFAULT_PROJECT_COLOR);
   const [folderId, setFolderId] = useState<string | null>(null);
   const [newFolderMode, setNewFolderMode] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
@@ -1138,8 +1224,9 @@ function ProjectDialog({
       if (!result.ok || !result.folder) {
         throw new Error(result.error ?? "Failed to create folder.");
       }
-      setFolderList((current) => [...current, result.folder]);
-      setFolderId(result.folder.id);
+      const folder = result.folder;
+      setFolderList((current) => [...current, folder]);
+      setFolderId(folder.id);
       setNewFolderMode(false);
       setNewFolderName("");
     } catch (folderError) {
@@ -1782,6 +1869,7 @@ const COLLAPSED_PROJECTS_KEY = "task-comment-float:collapsed-projects";
 const COLLAPSED_STATUSES_KEY = "task-comment-float:collapsed-statuses";
 const GROUP_BY_KEY = "task-comment-float:group-by";
 const PRESET_STORAGE_KEY = "task-comment-float:preset-id";
+const ENV_TARGET_KEY_PREFIX = "task-comment-float:env-target:";
 const SIDEBAR_COLLAPSED_KEY = "task-comment-float:sidebar-collapsed";
 const BROWSE_SCOPE_KEY = "task-comment-float:browse-scope";
 const BROWSE_SCOPE_EVENT = "tcf-browse-scope";
@@ -1882,6 +1970,56 @@ function readStoredPresetId(): string {
 function writeStoredPresetId(id: string): void {
   try {
     window.localStorage.setItem(PRESET_STORAGE_KEY, id);
+  } catch {
+    // Ignore quota / private-mode failures.
+  }
+}
+
+/**
+ * Per-preset environment default.
+ *
+ * Tasks owns the preset record, so Tasks Pro cannot add a field to it. We keep
+ * the default next to the preset id instead: picking a preset restores the
+ * environment target last used with it, and the preset editor writes the same
+ * key. Preset `environmentKind` is untouched and still wins when the target is
+ * "preset".
+ */
+function envTargetKey(presetId: string): string {
+  return `${ENV_TARGET_KEY_PREFIX}${presetId}`;
+}
+
+function readStoredEnvTarget(presetId: string): EnvTargetDraft {
+  if (!presetId) return EMPTY_ENV_TARGET;
+  try {
+    const raw = window.localStorage.getItem(envTargetKey(presetId));
+    if (!raw) return EMPTY_ENV_TARGET;
+    const parsed = JSON.parse(raw) as Partial<EnvTargetDraft> | null;
+    if (!parsed || typeof parsed !== "object") return EMPTY_ENV_TARGET;
+    const kind =
+      typeof parsed.kind === "string" && isEnvTargetKind(parsed.kind)
+        ? parsed.kind
+        : "preset";
+    return {
+      kind,
+      profileId: typeof parsed.profileId === "string" ? parsed.profileId : "",
+      environmentId:
+        typeof parsed.environmentId === "string" ? parsed.environmentId : "",
+      path: typeof parsed.path === "string" ? parsed.path : "",
+      branch: typeof parsed.branch === "string" ? parsed.branch : "",
+    };
+  } catch {
+    return EMPTY_ENV_TARGET;
+  }
+}
+
+function writeStoredEnvTarget(presetId: string, draft: EnvTargetDraft): void {
+  if (!presetId) return;
+  try {
+    if (draft.kind === "preset") {
+      window.localStorage.removeItem(envTargetKey(presetId));
+      return;
+    }
+    window.localStorage.setItem(envTargetKey(presetId), JSON.stringify(draft));
   } catch {
     // Ignore quota / private-mode failures.
   }
@@ -2385,6 +2523,281 @@ function FieldSelect({
 const RAIL_ROW_CLASS =
   "-mx-1.5 flex w-[calc(100%+0.75rem)] items-center gap-2 rounded-md px-1.5 py-1 text-left text-sm hover:bg-state-hover";
 
+function formatAssignee(assignee: AssigneeRow | null): string {
+  if (!assignee) return "Unassigned";
+  if (assignee.kind === "me") return "You";
+  if (assignee.kind === "thread") {
+    return assignee.title?.trim() || assignee.threadId || "Thread";
+  }
+  const preset = assignee.presetName?.trim() || "Agent";
+  const title = assignee.title?.trim();
+  return title ? `${preset} · ${title}` : preset;
+}
+
+/** Pick an existing bb thread to own the task and receive its brief. */
+function AssignThreadDialog({
+  open,
+  currentThreadId,
+  linkedBbProjectId,
+  onOpenChange,
+  onPick,
+  assigning,
+}: {
+  open: boolean;
+  currentThreadId?: string;
+  linkedBbProjectId: string | null;
+  onOpenChange: (open: boolean) => void;
+  onPick: (threadId: string) => void;
+  assigning: boolean;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [threads, setThreads] = useState<AssignableThreadRow[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    void (async () => {
+      try {
+        const result = await rpc.call("listAssignableThreads", {
+          linkedBbProjectId,
+          limit: 50,
+        });
+        if (cancelled) return;
+        if (!result.available) {
+          setThreads([]);
+          setError(result.error ?? "Could not list threads.");
+          return;
+        }
+        setThreads(result.threads);
+      } catch (err) {
+        if (cancelled) return;
+        setThreads([]);
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [linkedBbProjectId, open, rpc]);
+
+  const filtered = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return threads;
+    return threads.filter(
+      (thread) =>
+        thread.title.toLowerCase().includes(needle) ||
+        thread.id.toLowerCase().includes(needle),
+    );
+  }, [query, threads]);
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>Assign to thread</DialogTitle>
+          <DialogDescription>
+            Attach an existing bb thread and send it the task brief.
+          </DialogDescription>
+        </DialogHeader>
+        <Input
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Search title or thread id"
+          className="h-8"
+          aria-label="Search threads"
+        />
+        {error ? (
+          <p className="text-sm text-destructive" role="alert">
+            {error}
+          </p>
+        ) : null}
+        <div className="max-h-72 overflow-y-auto rounded-md border border-border">
+          {loading ? (
+            <p className="px-3 py-4 text-sm text-muted-foreground">
+              Loading threads…
+            </p>
+          ) : filtered.length === 0 ? (
+            <p className="px-3 py-4 text-sm text-muted-foreground">
+              No matching threads.
+            </p>
+          ) : (
+            <ul>
+              {filtered.map((thread) => (
+                <li key={thread.id} className="border-t border-border first:border-t-0">
+                  <button
+                    type="button"
+                    className="flex w-full flex-col gap-0.5 px-3 py-2.5 text-left hover:bg-state-hover disabled:opacity-50"
+                    disabled={assigning}
+                    onClick={() => onPick(thread.id)}
+                  >
+                    <span className="truncate text-sm">
+                      {thread.title || thread.id}
+                      {thread.id === currentThreadId ? " · this thread" : ""}
+                    </span>
+                    <span className="truncate text-xs text-muted-foreground">
+                      {thread.id} · {thread.status}
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/**
+ * Environment target picker shown next to the Spin agent preset select.
+ *
+ * "Preset default" sends no envTarget at all, so the server keeps the plain
+ * Tasks `delegate` path. The other kinds add an explicit target.
+ */
+function EnvTargetControls({
+  draft,
+  onChange,
+  profiles,
+  environments,
+  disabled,
+  layout,
+}: {
+  draft: EnvTargetDraft;
+  onChange: (next: EnvTargetDraft) => void;
+  profiles: EnvProfile[];
+  environments: EnvironmentOption[];
+  disabled: boolean;
+  layout: "rail" | "bar";
+}) {
+  const setField = <K extends keyof EnvTargetDraft>(
+    field: K,
+    value: EnvTargetDraft[K],
+  ) => onChange({ ...draft, [field]: value });
+
+  const controlClass = cn(selectClass, "h-8 w-full");
+  const ready = environments
+    .filter((environment) => environment.status === "ready")
+    .sort((a, b) =>
+      environmentOptionLabel(a).localeCompare(environmentOptionLabel(b)),
+    );
+  // Keep a selected-but-unready environment visible so the value never blanks.
+  const options =
+    draft.environmentId &&
+    !ready.some((environment) => environment.id === draft.environmentId)
+      ? [
+          ...ready,
+          environments.find(
+            (environment) => environment.id === draft.environmentId,
+          ),
+        ].filter((item): item is EnvironmentOption => item != null)
+      : ready;
+  const problem = envTargetError(draft);
+
+  return (
+    <div
+      className={cn(
+        "flex min-w-0 gap-1.5",
+        layout === "rail" ? "flex-col" : "flex-col sm:flex-row sm:items-center",
+      )}
+    >
+      <select
+        aria-label="Environment target"
+        className={cn(controlClass, layout === "bar" && "sm:w-44")}
+        value={draft.kind}
+        disabled={disabled}
+        onChange={(event) => {
+          if (!isEnvTargetKind(event.target.value)) return;
+          setField("kind", event.target.value);
+        }}
+      >
+        {ENV_TARGET_KINDS.map((kind) => (
+          <option key={kind} value={kind}>
+            {ENV_TARGET_LABELS[kind]}
+          </option>
+        ))}
+      </select>
+
+      {draft.kind === "profile" ? (
+        <select
+          aria-label="Environment profile"
+          className={controlClass}
+          value={draft.profileId}
+          disabled={disabled}
+          onChange={(event) => setField("profileId", event.target.value)}
+        >
+          <option value="">
+            {profiles.length === 0 ? "No profiles saved" : "Pick a profile…"}
+          </option>
+          {profiles.map((profile) => (
+            <option key={profile.id} value={profile.id}>
+              {profile.name}
+            </option>
+          ))}
+        </select>
+      ) : null}
+
+      {draft.kind === "reuse" ? (
+        <select
+          aria-label="Environment"
+          className={controlClass}
+          value={draft.environmentId}
+          disabled={disabled}
+          onChange={(event) => setField("environmentId", event.target.value)}
+        >
+          <option value="">
+            {options.length === 0 ? "No environments found" : "Pick an environment…"}
+          </option>
+          {options.map((environment) => (
+            <option key={environment.id} value={environment.id}>
+              {environmentOptionLabel(environment)}
+            </option>
+          ))}
+        </select>
+      ) : null}
+
+      {draft.kind === "path" ? (
+        <>
+          <Input
+            value={draft.path}
+            onChange={(event) => setField("path", event.target.value)}
+            placeholder="/home/bb/projects/sre-uat"
+            aria-label="Absolute path"
+            className="h-8"
+            disabled={disabled}
+          />
+          <Input
+            value={draft.branch}
+            onChange={(event) => setField("branch", event.target.value)}
+            placeholder="existing branch — optional"
+            aria-label="Branch"
+            className="h-8"
+            disabled={disabled}
+          />
+        </>
+      ) : null}
+
+      {draft.kind !== "preset" ? (
+        <p
+          className={cn(
+            "min-w-0 truncate text-[11px]",
+            problem ? "text-destructive" : "text-muted-foreground",
+          )}
+          title={problem ?? describeEnvTargetDraft(draft, profiles, environments)}
+        >
+          {problem ?? describeEnvTargetDraft(draft, profiles, environments)}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 function PropertiesRail({
   task,
   project,
@@ -2396,6 +2809,16 @@ function PropertiesRail({
   onDispatch,
   dispatching,
   saving,
+  assignee,
+  assigning,
+  onAssignToMe,
+  onOpenAssignThread,
+  onAssignToCurrentThread,
+  currentThreadId,
+  envTarget,
+  onEnvTargetChange,
+  envProfiles,
+  environments,
   onUpdate,
   onToggleLabel,
   onOpenThread,
@@ -2410,6 +2833,16 @@ function PropertiesRail({
   onDispatch: () => void;
   dispatching: boolean;
   saving: boolean;
+  assignee: AssigneeRow | null;
+  assigning: boolean;
+  onAssignToMe: () => void;
+  onOpenAssignThread: () => void;
+  onAssignToCurrentThread: () => void;
+  currentThreadId?: string;
+  envTarget: EnvTargetDraft;
+  onEnvTargetChange: (next: EnvTargetDraft) => void;
+  envProfiles: EnvProfile[];
+  environments: EnvironmentOption[];
   onUpdate: (patch: {
     status?: TaskStatus;
     priority?: TaskPriority;
@@ -2426,6 +2859,8 @@ function PropertiesRail({
     "min-w-0 flex-1 cursor-pointer bg-transparent text-sm",
     "focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50",
   );
+  const busy = dispatching || assigning || saving;
+  const envProblem = envTargetError(envTarget);
 
   return (
     <aside className="hidden w-56 shrink-0 overflow-y-auto border-l border-border px-3 py-5 md:block">
@@ -2511,7 +2946,63 @@ function PropertiesRail({
       </div>
 
       <div className="mb-1 mt-3 text-[11px] font-semibold text-muted-foreground">
-        Dispatch
+        Assignee
+      </div>
+      <div className="flex flex-col gap-1.5 py-0.5">
+        <div className="flex items-center gap-2 text-sm">
+          <Icon
+            name="UserRound"
+            className="size-3.5 shrink-0 text-muted-foreground"
+          />
+          <span className="min-w-0 truncate" title={formatAssignee(assignee)}>
+            {formatAssignee(assignee)}
+          </span>
+        </div>
+        {assignee && assignee.kind !== "me" && assignee.threadId ? (
+          <button
+            type="button"
+            className="truncate text-left text-xs text-muted-foreground hover:underline"
+            onClick={() => onOpenThread(assignee.threadId)}
+          >
+            Open thread
+          </button>
+        ) : null}
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          className="w-full"
+          onClick={onAssignToMe}
+          disabled={busy || assignee?.kind === "me"}
+        >
+          {assigning ? "Assigning…" : "Assign to me"}
+        </Button>
+        {currentThreadId ? (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="w-full"
+            onClick={onAssignToCurrentThread}
+            disabled={busy}
+          >
+            Assign to this thread
+          </Button>
+        ) : null}
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          className="w-full"
+          onClick={onOpenAssignThread}
+          disabled={busy}
+        >
+          Assign to thread…
+        </Button>
+      </div>
+
+      <div className="mb-1 mt-3 text-[11px] font-semibold text-muted-foreground">
+        Spin agent
       </div>
       <div className="flex flex-col gap-1.5 py-0.5">
         <select
@@ -2531,12 +3022,20 @@ function PropertiesRail({
             ))
           )}
         </select>
+        <EnvTargetControls
+          draft={envTarget}
+          onChange={onEnvTargetChange}
+          profiles={envProfiles}
+          environments={environments}
+          disabled={dispatching}
+          layout="rail"
+        />
         <Button
           type="button"
           size="sm"
           className="w-full"
           onClick={onDispatch}
-          disabled={!presetId || dispatching || saving}
+          disabled={!presetId || busy || envProblem != null}
         >
           {dispatching ? "Spinning…" : "Spin agent"}
         </Button>
@@ -2576,6 +3075,7 @@ function PropertiesRail({
 function TaskCommentPanel({
   initialKey = "",
   syncSubPath = false,
+  currentThreadId,
 }: TaskPanelProps) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
@@ -2616,6 +3116,14 @@ function TaskCommentPanel({
   const [dispatching, setDispatching] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarCollapsed);
 
+  const [assignee, setAssignee] = useState<AssigneeRow | null>(null);
+  const [assigning, setAssigning] = useState(false);
+  const [assignDialogOpen, setAssignDialogOpen] = useState(false);
+
+  const [envTarget, setEnvTarget] = useState<EnvTargetDraft>(EMPTY_ENV_TARGET);
+  const [envProfiles, setEnvProfiles] = useState<EnvProfile[]>([]);
+  const [environments, setEnvironments] = useState<EnvironmentOption[]>([]);
+
   const scrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const loadGen = useRef(0);
@@ -2630,6 +3138,7 @@ function TaskCommentPanel({
     setThreads([]);
     setPullRequests([]);
     setUnavailableThreadIds([]);
+    setAssignee(null);
     setError(null);
     setBody("");
   }, []);
@@ -2653,6 +3162,7 @@ function TaskCommentPanel({
           setThreads([]);
           setPullRequests([]);
           setUnavailableThreadIds([]);
+          setAssignee(null);
           setError(result.error ?? "Task not found.");
           return;
         }
@@ -2664,6 +3174,7 @@ function TaskCommentPanel({
         setThreads(result.threads);
         setPullRequests(result.pullRequests);
         setUnavailableThreadIds(result.unavailableThreadIds);
+        setAssignee(result.assignee);
         setError(null);
         requestAnimationFrame(() => composerRef.current?.focus());
       } catch (err) {
@@ -2752,6 +3263,27 @@ function TaskCommentPanel({
   useEffect(() => {
     void refreshPresets();
   }, [refreshPresets]);
+
+  const refreshEnvOptions = useCallback(async () => {
+    try {
+      const [profileResult, environmentResult] = await Promise.all([
+        rpc.call("listEnvProfiles", null),
+        rpc.call("listEnvironments", {}),
+      ]);
+      setEnvProfiles(profileResult.available ? profileResult.profiles : []);
+      setEnvironments(
+        environmentResult.available ? environmentResult.environments : [],
+      );
+    } catch {
+      // Keep the manual absolute-path escape hatch usable when this fails.
+      setEnvProfiles([]);
+      setEnvironments([]);
+    }
+  }, [rpc]);
+
+  useEffect(() => {
+    void refreshEnvOptions();
+  }, [refreshEnvOptions]);
 
   useEffect(() => {
     setListPref(loadListPreference(listScope));
@@ -2876,13 +3408,36 @@ function TaskCommentPanel({
     if (nextId) writeStoredPresetId(nextId);
   };
 
+  // Each preset remembers the environment it was last dispatched with. This
+  // runs on preset change only, so it never clobbers an in-progress edit.
+  useEffect(() => {
+    setEnvTarget(readStoredEnvTarget(presetId));
+  }, [presetId]);
+
+  const onEnvTargetChange = useCallback(
+    (next: EnvTargetDraft) => {
+      setEnvTarget(next);
+      writeStoredEnvTarget(presetId, next);
+    },
+    [presetId],
+  );
+
   const onDispatch = useCallback(async () => {
     if (!task || !presetId || dispatching) return;
+    const problem = envTargetError(envTarget);
+    if (problem) {
+      toast.error(problem);
+      return;
+    }
     setDispatching(true);
     try {
+      const target = envTargetInput(envTarget);
       const result = await rpc.call("dispatch", {
         taskId: task.id,
         presetId,
+        // Omit the field entirely for the preset default so the server keeps
+        // the plain Tasks delegate path.
+        ...(target ? { envTarget: target } : {}),
       });
       if (!result.ok) {
         toast.error(result.error ?? "Failed to spin agent.");
@@ -2890,14 +3445,79 @@ function TaskCommentPanel({
       }
       const presetName =
         presets.find((preset) => preset.id === presetId)?.name ?? "Agent";
-      toast.success(`${presetName} started on ${task.key}.`);
+      const where =
+        envTarget.kind === "preset"
+          ? ""
+          : ` in ${describeEnvTargetDraft(envTarget, envProfiles, environments)}`;
+      toast.success(`${presetName} started on ${task.key}${where}.`);
       await loadTask(task.key);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setDispatching(false);
     }
-  }, [dispatching, loadTask, presetId, presets, rpc, task]);
+  }, [
+    dispatching,
+    envProfiles,
+    envTarget,
+    environments,
+    loadTask,
+    presetId,
+    presets,
+    rpc,
+    task,
+  ]);
+
+  const onAssignToMe = useCallback(async () => {
+    if (!task || assigning) return;
+    setAssigning(true);
+    try {
+      const result = await rpc.call("assignToMe", { taskId: task.id });
+      if (!result.ok) {
+        toast.error(result.error ?? "Failed to assign to me.");
+        return;
+      }
+      toast.success(`Assigned ${task.key} to you.`);
+      await loadTask(task.key);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAssigning(false);
+    }
+  }, [assigning, loadTask, rpc, task]);
+
+  const onAssignToThread = useCallback(
+    async (threadId: string) => {
+      if (!task || assigning) return;
+      setAssigning(true);
+      try {
+        const result = await rpc.call("assignToThread", {
+          taskId: task.id,
+          threadId,
+        });
+        if (!result.ok) {
+          toast.error(result.error ?? "Failed to assign thread.");
+          return;
+        }
+        toast.success(`Assigned ${task.key} to ${threadId}.`);
+        setAssignDialogOpen(false);
+        await loadTask(task.key);
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : String(err));
+      } finally {
+        setAssigning(false);
+      }
+    },
+    [assigning, loadTask, rpc, task],
+  );
+
+  const onAssignToCurrentThread = useCallback(async () => {
+    if (!currentThreadId) {
+      toast.error("Open a thread first, then assign.");
+      return;
+    }
+    await onAssignToThread(currentThreadId);
+  }, [currentThreadId, onAssignToThread]);
 
   const onSubmit = useCallback(
     async (event?: FormEvent) => {
@@ -2935,6 +3555,7 @@ function TaskCommentPanel({
           setThreads(view.threads);
           setPullRequests(view.pullRequests);
           setUnavailableThreadIds(view.unavailableThreadIds);
+          setAssignee(view.assignee);
         } else {
           setComments((prev) => [...prev, result.comment!]);
         }
@@ -3026,36 +3647,75 @@ function TaskCommentPanel({
 
       {task ? (
         <div className="shrink-0 border-b border-border px-4 py-2 md:hidden md:px-5">
-          <div className="mx-auto flex w-full max-w-3xl items-center gap-2">
-            <label className="sr-only" htmlFor="tcf-preset">
-              Agent preset
-            </label>
-            <select
-              id="tcf-preset"
-              aria-label="Agent preset"
-              className={cn(selectClass, "min-w-0 flex-1")}
-              value={presetId}
-              onChange={(event) => onPresetChange(event.target.value)}
-              disabled={dispatching || presets.length === 0}
-            >
-              {presets.length === 0 ? (
-                <option value="">No presets</option>
-              ) : (
-                presets.map((preset) => (
-                  <option key={preset.id} value={preset.id}>
-                    {preset.name}
-                  </option>
-                ))
-              )}
-            </select>
-            <Button
-              type="button"
-              size="sm"
-              onClick={() => void onDispatch()}
-              disabled={!presetId || dispatching || loading}
-            >
-              {dispatching ? "Spinning…" : "Spin agent"}
-            </Button>
+          <div className="mx-auto flex w-full max-w-3xl flex-col gap-2">
+            <div className="flex items-center gap-2">
+              <label className="sr-only" htmlFor="tcf-preset">
+                Agent preset
+              </label>
+              <select
+                id="tcf-preset"
+                aria-label="Agent preset"
+                className={cn(selectClass, "min-w-0 flex-1")}
+                value={presetId}
+                onChange={(event) => onPresetChange(event.target.value)}
+                disabled={dispatching || presets.length === 0}
+              >
+                {presets.length === 0 ? (
+                  <option value="">No presets</option>
+                ) : (
+                  presets.map((preset) => (
+                    <option key={preset.id} value={preset.id}>
+                      {preset.name}
+                    </option>
+                  ))
+                )}
+              </select>
+              <Button
+                type="button"
+                size="sm"
+                onClick={() => void onDispatch()}
+                disabled={
+                  !presetId ||
+                  dispatching ||
+                  loading ||
+                  envTargetError(envTarget) != null
+                }
+              >
+                {dispatching ? "Spinning…" : "Spin agent"}
+              </Button>
+            </div>
+            <EnvTargetControls
+              draft={envTarget}
+              onChange={onEnvTargetChange}
+              profiles={envProfiles}
+              environments={environments}
+              disabled={dispatching}
+              layout="bar"
+            />
+            <div className="flex items-center gap-2">
+              <span className="min-w-0 truncate text-xs text-muted-foreground">
+                {formatAssignee(assignee)}
+              </span>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                className="ml-auto"
+                onClick={() => void onAssignToMe()}
+                disabled={assigning || assignee?.kind === "me"}
+              >
+                {assigning ? "Assigning…" : "Assign to me"}
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={() => setAssignDialogOpen(true)}
+                disabled={assigning}
+              >
+                Assign to thread…
+              </Button>
+            </div>
           </div>
         </div>
       ) : null}
@@ -3294,6 +3954,16 @@ function TaskCommentPanel({
           onDispatch={() => void onDispatch()}
           dispatching={dispatching}
           saving={saving}
+          assignee={assignee}
+          assigning={assigning}
+          onAssignToMe={() => void onAssignToMe()}
+          onOpenAssignThread={() => setAssignDialogOpen(true)}
+          onAssignToCurrentThread={() => void onAssignToCurrentThread()}
+          currentThreadId={currentThreadId}
+          envTarget={envTarget}
+          onEnvTargetChange={onEnvTargetChange}
+          envProfiles={envProfiles}
+          environments={environments}
           onUpdate={(patch) => void applyPatch(patch)}
           onToggleLabel={toggleLabel}
           onOpenThread={(threadId) => navigate.toThread(threadId)}
@@ -3351,6 +4021,15 @@ function TaskCommentPanel({
           </div>
         </form>
       ) : null}
+
+      <AssignThreadDialog
+        open={assignDialogOpen}
+        currentThreadId={currentThreadId}
+        linkedBbProjectId={project?.linkedBbProjectId ?? null}
+        onOpenChange={setAssignDialogOpen}
+        onPick={(threadId) => void onAssignToThread(threadId)}
+        assigning={assigning}
+      />
     </div>
   );
 }

@@ -9,7 +9,7 @@
   "description": "Companion to Tasks: list, edit, comment, and spin agents with context kept on screen.",
   "bb": {
     "name": "Tasks Pro",
-    "description": "A richer Tasks companion — browse, edit, comment, and dispatch agents without leaving the panel.",
+    "description": "A richer Tasks companion \u2014 browse, edit, comment, and dispatch agents without leaving the panel.",
     "branding": {
       "icon": "MessageAdd01"
     },
@@ -36,6 +36,12 @@
     "better-sqlite3": "^12.0.0",
     "hono": "^4.11.9",
     "sonner": "^2.0.8",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.7"
+  },
+  "scripts": {
+    "build": "bb plugin build",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
   }
 }
